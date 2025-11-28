@@ -329,6 +329,9 @@ Amplification factor: 1000x
 Mitigation: Smaller chunk_rows
 ```
 
+** CoW + vacuum**:
+Creating a new chunk for every update can be heavy. A patching approach + compaction could be better (actually WIP)
+
 ## 7. Quick Start
 
 ```python
