@@ -1,17 +1,3 @@
-"""
-SQL:2023 MDA & Advanced Vector Operations (Generic N-D Edition)
-----------------------------------------------------------------
-DESIGN PRINCIPLES:
-1. Generic N-D support - no forced 2D conversions
-2. Matrix view ONLY for critical ML ops (cosine on 1D vectors)
-3. All operations return pa.Table for consistent chaining
-4. Backward compatible with existing benchmarks
-
-ARCHITECTURE:
-- List operations: Pure PyArrow (fast, zero-copy)
-- N-D operations: NumPy with explicit shape handling
-- ML operations: Optimized paths with matrix view when beneficial
-"""
 
 import pyarrow as pa
 import pyarrow.compute as pc

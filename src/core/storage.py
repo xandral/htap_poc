@@ -1,13 +1,3 @@
-"""
-NDimStorage - Multi-Dimensional Storage with Merge-on-Read
-----------------------------------------------------------
-Features:
-- Multi-dimensional partitioning (hash + range)
-- Automatic metadata inference
-- Merge-on-Read update model (patch log)
-- Parallel vector operations during scan
-"""
-
 from pathlib import Path
 import threading
 import time
