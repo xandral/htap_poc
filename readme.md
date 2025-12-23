@@ -1,389 +1,195 @@
-# NDim HTAP Storage Engine - POC
+# NDim HTAP Storage Engine (PoC)
 
-**A Multi-Dimensional, Columnar Storage Engine for HTAP Workloads**  
-*Python Proof-of-Concept → Future Rust Implementation*
+![Status](https://img.shields.io/badge/Status-Experimental%20%2F%20PoC-orange)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Dependencies](https://img.shields.io/badge/Backend-PyArrow%20%7C%20NumPy-yellowgreen)
 
----
-
-## Table of Contents
-
-1. [Genesis & Inspiration](#1-genesis--inspiration)
-2. [Core Concept: From Zarr to Tabular](#2-core-concept-from-zarr-to-tabular)
-3. [Architecture Overview](#3-architecture-overview)
-4. [N-Dimensional Partitioning Strategy](#4-n-dimensional-partitioning-strategy)
-5. [MVCC Implementation](#5-mvcc-implementation)
-6. [Performance Model](#6-performance-model)
-7. [Quick Start](#7-quick-start)
-
+**A Multi-Dimensional Columnar Storage Engine inspired by Zarr, with native SQL:2023 MDA vector support.**
 
 ---
 
-## 1. Genesis & Inspiration
+### ⚠️ Disclaimer: Proof of Concept
 
-### The Zarr Foundation
-
-**Zarr** is a format for storing chunked, compressed N-dimensional arrays, widely used in scientific computing (climate models, genomics, satellite imagery).
-
-**Core principle**: Split large arrays into small rectangular chunks indexed by coordinates.
-
-```
-3D Array: Temperature(Latitude, Longitude, Time)
-Shape: [1000, 2000, 365]
-
-Chunked as: [100, 100, 30] blocks
-Result: 10 × 20 × 13 = 2,600 files
-
-File naming: /data/0.0.0, /data/0.1.0, ...
-           coordinate: (lat_chunk, lon_chunk, time_chunk)
-
-Query: "Temperature for Rome (lat=41, lon=12) in January"
-→ Calculate chunk: (4, 0, 0)
-→ Read 1 file instead of 2,600
-```
-
-**Key insight**: Coordinate-based addressing enables O(1) file lookup, minimal I/O.
+> **PLEASE NOTE: This project is currently under active development. It is a strictly experimental Proof of Concept (PoC) designed to demonstrate architectural patterns.** >
+> **Features are incomplete, bugs are present. Use only for research and testing purposes.**
 
 ---
 
-### Mapping to Tabular Data
+## Overview
 
-**Question**: Can we apply this to relational tables?
+NDim HTAP explores a hybrid approach to data storage, merging the analytical power of columnar databases (OLAP) with the N-dimensional flexibility of scientific array computing.
 
-**Conceptual mapping**:
+The architecture abandons centralized B-Tree indexes in favor of a **coordinate-based access pattern** inspired by the **Zarr** format. Every row and column is mathematically mapped to a physical file, enabling parallel reads and immediate data pruning.
 
-| Zarr (Arrays) | NDim HTAP (Tables) |
-|---------------|--------------------|
-| Latitude dimension | Row Chunk ID |
-| Longitude dimension | Column Chunk ID |
-| Time dimension | Transaction Version (MVCC) |
-| Extra dimensions | Hash/Range partitioning |
-| Chunk coordinate | File path |
+### Unified HTAP Architecture
+**Goal:** Achieve an **Hybrid Transactional/Analytical Processing (HTAP)** system.
+Unlike traditional systems that separate operational data (SQL) from AI data (Vectors), this engine unifies them:
 
-**Result**: Tables chunked into small rectangles addressable by multi-dimensional coordinates.
+* **Transactional (OLTP):** Supports fast lookups, updates by ID, and consistency using Hash Indexing.
+* **Analytical (OLAP):** Supports massive scans, tensor slicing, and vector math natively.
+* **The Benefit:** Filter by SQL metadata (e.g., `status='active'`) and compute complex Vector math (e.g., `cosine_similarity`) in a **single, zero-copy pass**.
 
----
+## Core Architecture
 
-## 2. Core Concept: From Zarr to Tabular
+The system organizes data into sparse "Hypercubes" stored as Parquet files. The physical location of any data point is deterministically calculated via its coordinates, removing the need for centralized lookup indexes.
 
-### Problem Statement
+### 1. The Coordinate System (Zarr-inspired)
+Instead of scanning indexes, the engine calculates the file path using a grid system:
+`chunk_r{row}_c{col}_h{hash}_rg{range}_v{ver}.parquet`
 
-Traditional databases have opposing trade-offs:
+| Dimension | Role | Description |
+| :--- | :--- | :--- |
+| **Row Index** | Primary Key | Sequential grouping (e.g., 100k rows per chunk). |
+| **Column Group** | Optimization | Vertical partitioning to reduce I/O on wide tables. |
+| **Hash Dim** | Sharding | Distribution based on key hash (e.g., `user_id`). |
+| **Range Dim** | Pruning | Ordered partitioning (e.g., `timestamp`) for time-series. |
 
-**OLTP (Row-oriented)**:
-- Storage: `[Row1: col1,col2,...,colN | Row2: ... | Row3: ...]`
-- Fast: Point lookups (`WHERE id=X`)
-- Slow: Analytics (`SELECT AVG(col)` requires full scan)
+###  Core Indexing Logic:
 
-**OLAP (Column-oriented)**:
-- Storage: `[Col1: all_values | Col2: all_values | ...]`
-- Fast: Aggregations (`SELECT AVG(col)`)
-- Slow: Row reconstruction
+The system calculates the physical coordinate (File Path + Row Offset) using the configured chunk sizes.
 
-**HTAP Goal**: Support both workloads without ETL pipeline.
+#### The Mapping Formula
+For a given `Primary_Key` (e.g., a timestamp or auto-increment ID) and a `Column_Index`:
 
----
+**1. Vertical Mapping (Which Row?)**
+Determine the file partition and the specific row inside it:
+* **File Partition** = `Primary_Key // Chunk_Rows`
+* **Internal Row Offset** = `Primary_Key % Chunk_Rows`
 
-### NDim HTAP Approach
-
-**Insight**: Chunk tables in multiple dimensions simultaneously.
-
-```
-Original Table: 1M rows × 100 columns
-
-Dimension 1: ROW CHUNKS (Horizontal Partitioning)
-  Chunk 0: Rows 0-99,999
-  Chunk 1: Rows 100,000-199,999
-  ...
-
-Dimension 2: COLUMN CHUNKS (Vertical Partitioning)
-  Group 0: Columns 0-31
-  Group 1: Columns 32-63
-  ...
-
-Dimension 3+: USER-DEFINED DIMENSIONS
-  Hash: hash(city) % buckets
-  Range: timestamp // interval
-
-Result: Each file is a small rectangle
-  chunk_r0_c0_h3_r100_v1.parquet
-    - Rows: 0-99,999
-    - Columns: 0-31
-    - Hash bucket: 3
-    - Range bucket: 100
-    - Version: 1
-    - Size: ~10MB (vs 10GB full table)
-```
-
-**Query optimization**: Read only files intersecting query predicates.
+**2. Horizontal Mapping (Which Column Group?)**
+Determine which column chunk file to open:
+* **Column Group** = `Column_Index // Chunk_Cols`
+* **Internal Column Offset** = `Column_Index % Chunk_Cols`
 
 ---
 
-## 3. Architecture Overview
+#### Concrete Example
+Let's assume the system is configured with:
+* `CHUNK_ROWS = 1000` (rows per file)
+* `CHUNK_COLS = 10` (columns per file)
 
-### High-Level Components
+If we want to retrieve **User ID 2505** and **Column 23**:
 
-```
-CLIENT
-  |
-  v
-QUERY ENGINE
-  - FilterEngine: Evaluates logic expressions (AND/OR/comparison)
-  - PruningEngine: Maps filters to file coordinates
-  - ParallelIO: ThreadPool for concurrent reads
-  |
-  v
-CATALOG
-  - FileCatalog: Tracks file versions (logical_key -> max_version)
-  - SequenceManager: Persistent global_id counter
-  - VersionTracker: MVCC coordination
-  |
-  v
-STORAGE LAYER
-  - Parquet files (columnar, compressed)
-  - Naming: chunk_r{row}_c{col}_h{hash}_r{range}_v{version}.parquet
-```
+1.  **Partition Calculation:** `2505 // 1000 = 2` → The system opens the file for **Partition 2**.
+2.  **Row Seek:** `2505 % 1000 = 505` → The system seeks directly to **Row 505**.
+3.  **Column Group:** `23 // 10 = 2` → The system reads from **Col-Group 2**.
 
----
+**Result:** The engine opens `partition_r2_c2.parquet` and reads row `505` instantly.
 
-## 4. N-Dimensional Partitioning Strategy
+### 2. SQL:2023 MDA Exploration
+This project includes an **experimental implementation** of the Multi-Dimensional Arrays (MDA) concepts introduced in the SQL:2023 standard. 
 
-### Dimension Types
+Rather than treating arrays strictly as unrelated lists (like `ARRAY[]` in older SQL), this engine attempts to treat columns as **mathematical tensors**.
 
-**PRIMARY DIMENSION: Row Chunk**
-- Always present
-- Sequential: `global_id // chunk_rows`
-- Controls horizontal scaling
-- Example: 1M rows with chunk_rows=100k → 10 chunks
+## Concurrency: MVCC & Merge-on-Read
 
-**COLUMN DIMENSION: Vertical Partitioning**
-- Groups related columns
-- Fixed size: chunk_cols (e.g., 32)
-- Purpose: Read only needed columns
-- Example: 100 columns → 4 column groups
+NDim HTAP handles concurrency using a **Multi-Version Concurrency Control (MVCC)** model combined with a **Merge-on-Read** strategy. This ensures that readers are never blocked by writers (`Readers don't block Writers`).
 
-**HASH DIMENSIONS: Categorical Distribution**
-- User-defined columns for even distribution
-- Calculation: `hash(value) % buckets`
-- Best for: High-cardinality categorical (user_id, session_id, country)
-- Example: `city` with 10 buckets → hash('Roma') % 10 = 3
+### 1. Immutability & Versioning
+Data chunks on disk are **immutable**. When an update occurs (e.g., updating a user's embedding or status), the engine does not modify the existing Parquet file. Instead:
 
-**RANGE DIMENSIONS: Ordered Distribution**
-- User-defined columns for range queries
-- Calculation: `value // interval`
-- Best for: Numerical/temporal (timestamp, price, age)
-- Example: `timestamp` with interval=86400 → bucket = day_number
+1.  **Read:** The affected chunk is loaded into memory.
+2.  **Patch/Apply:** The update is applied to the in-memory PyArrow table.
+3.  **Write New Version:** A **new file** is written with an incremented version number.
+    * *Old:* `chunk_r1_c0_h5_..._v1.parquet`
+    * *New:* `chunk_r1_c0_h5_..._v2.parquet`
 
-**VERSION DIMENSION: MVCC**
-- Copy-on-Write versioning
-- Monotonically increasing per logical chunk
-- Purpose: Snapshot isolation
-- Example: Update creates v2, readers still see v1
+### 2. The Catalog (Merge-on-Read Logic)
+The `SequenceManager` maintains a lightweight **File Catalog** (JSON-based in this PoC) acting as the source of truth.
 
----
+* **Snapshot Isolation:** When a `DDIMSession` starts a read query, it takes a "snapshot" of the active file versions.
+* **Logical Merge:** Even if a writer creates `v3` while a reader is processing `v2`, the reader continues to use `v2` referenced in its snapshot. The "Merge" happens logically by resolving the latest committed version ID for each coordinate before scanning.
 
-## 5. MVCC Implementation
+### 3. Vacuuming (Garbage Collection)
+Since updates generate new files, the storage grows over time. A `vacuum()` process (planned) scans the catalog to identify and physically delete "stale" versions (e.g., `v1` when `v2` is active and no active queries rely on `v1`).
 
-### Versioning Strategy
+## Quick Start Example
 
-**Concept**: Each logical chunk can have multiple versions coexisting on disk.
+The `DDIMSession` API provides a lazy-execution interface similar to Spark.
 
-```
-Timeline:
-T=0: Write initial data
-     chunk_r0_c0_h3_r5_v1.parquet
-
-T=1: Update 10% of rows
-     chunk_r0_c0_h3_r5_v2.parquet (new)
-     v1 still exists
-
-T=2: Vacuum (garbage collection)
-     v1 deleted, v2 remains
-```
-
-**Version tracking**:
 ```python
-catalog.active_versions = {
-    'chunk_r0_c0_h3_r5': 2,  # Latest version
-    'chunk_r0_c1_h3_r5': 1,
-    ...
+fimport pyarrow as pa
+from src.core.storage import NDimStorage
+from src.core.vector_operations import VectorOps
+
+# 1. SETUP HTAP STORAGE
+# We configure 'hash_dims' for fast SQL-like lookups (OLTP)
+# The engine automatically handles the Vector data (OLAP)
+store = NDimStorage("./demo_htap", hash_dims={"user_id": 4})
+
+# 2. INSERT HYBRID DATA
+# We mix standard SQL columns with AI Tensor columns
+data = {
+    "user_id": [1, 2, 3],              # SQL: Primary Key
+    "role": ["admin", "user", "user"], # SQL: Metadata
+    "face_embedding": [                # TENSOR: AI Data (Vectors)
+        [0.9, 0.1, 0.0],
+        [0.1, 0.8, 0.1],
+        [0.2, 0.2, 0.6]
+    ]
 }
-```
+store.write_batch(pa.Table.from_pydict(data))
 
-**Reader isolation**:
-- Readers call `get_active_files()` at query start
-- Snapshot: List of files with specific versions
-- Subsequent writes don't affect this snapshot
-- Result: Repeatable reads (similar to PostgreSQL REPEATABLE READ)
+# 3. RUN HYBRID QUERY
+# Scenario: Find 'users' (SQL) and calculate their vector magnitude (Tensor)
+print("--- HTAP Query Results ---")
 
----
+def compute_magnitude(table):
+    # Perform math on the tensor column on-the-fly
+    return VectorOps.mda_reduce_sum(table, "face_embedding")
 
-### Vacuum Process
-
-```python
-def vacuum(self):
-    with catalog.lock:
-        active_map = catalog.active_versions.copy()
+result = store.scan(
+    # SQL FILTER: Standard WHERE clause
+    filters=[("role", "=", "user")], 
     
-    for file in directory:
-        logical_key, version = parse_filename(file)
-        
-        if version < active_map[logical_key]:
-            file.unlink()  # Delete old version
-```
-
-**Properties**:
-- Frees disk space
-- Safe: Only deletes versions strictly older than active
-- Issue: Running readers might still have handles to deleted files
-  - Linux: File remains accessible until close (unlink delayed)
-  - Windows: Deletion might fail if file is open
-
----
-
-## 6. Performance Model
-
-### Strengths
-
-**Point Lookups (OLTP)**:
-```
-Query: SELECT * FROM table WHERE global_id = 42
-
-Coordinate calculation: O(1)
-  row_chunk = 42 // 100_000 = 0
-  
-Files to read: 4 (one per column group, all in chunk_r0)
-Total I/O: 40MB (4 files × 10MB)
-vs Traditional: 10GB (full table scan)
-
-Speedup: 250x
-```
-
-**Range Queries**:
-```
-Query: SELECT * FROM table WHERE timestamp BETWEEN t1 AND t2
-
-Range bucket calculation: O(1)
-  start_bucket = t1 // 86400
-  end_bucket = t2 // 86400
-  buckets_needed = end_bucket - start_bucket + 1
-
-Files to read: buckets_needed × hash_buckets × col_chunks
-vs Traditional: All files
-
-Example: 7-day range, 10 hash buckets, 4 col chunks
-  NDim HTAP: 7 × 10 × 4 = 280 files
-  Traditional: 10,000 files
-  Speedup: 35x
-```
-
-**Analytical Scans**:
-```
-Query: SELECT AVG(age) FROM table
-
-Column pruning:
-  Needed: global_id, age
-  Files: Only c0 (contains age)
-  
-Total I/O: 2,500 files (c0 only)
-vs Row-oriented: 10,000 files (all columns)
-
-Speedup: 4x (with 4 column groups)
-```
-
----
-
-### Limitations
-
-**Wide Filters** (No Pruning):
-```
-Query: SELECT * FROM table WHERE status = 'active'
-
-If 'status' not in hash_dims or range_dims:
-  No pruning possible
-  Must scan all files
-  
-Performance: Same as traditional (full scan)
-```
-
-**Cross-Chunk Column Access**:
-```
-Query: SELECT col1, col50 FROM table WHERE col1 = X
-
-If col1 in c0 and col50 in c2:
-  Must read both column groups
-  Cannot skip c1
-  
-Overhead: Read intermediate column group
-```
-
-**Update Performance**:
-```
-Update small percentage of large file:
-  - Read: 10MB
-  - Filter: 0.1% matches
-  - Write: 10MB (entire file, Copy-on-Write)
-  
-Overhead: 10MB written for 10KB changed
-Amplification factor: 1000x
-
-Mitigation: Smaller chunk_rows
-```
-
-## 7. Quick Start
-
-```python
-from ndim_storage import NDimStorage
-import pyarrow as pa
-
-# Initialize storage
-storage = NDimStorage(
-    base_path="./data",
-    chunk_rows=100_000,         # 100k rows per chunk
-    chunk_cols=32,              # 32 columns per group
-    hash_dims={'country': 8},   # 8 hash buckets for country
-    range_dims={'timestamp': 86400}  # 1-day range buckets
+    # TENSOR COMPUTE: Math operation
+    vector_ops=[compute_magnitude],
+    
+    columns=["user_id", "face_embedding"]
 )
 
-# Write data
-table = pa.table({
-    'id': [1, 2, 3],
-    'country': ['US', 'IT', 'FR'],
-    'timestamp': [1234567890, 1234567900, 1234567910],
-    'value': [100, 200, 300]
-})
-storage.write_batch(table)
-
-# Query
-result = storage.scan(
-    filters=[('country', '=', 'IT'), 'AND', ('timestamp', '>', 1234567890)],
-    columns=['id', 'value']
-)
+# Output shows SQL ID + Computed Tensor Result
 print(result.to_pandas())
-
-# Update
-storage.update(
-    filters=[('country', '=', 'US')],
-    updates={'value': 999}
-)
-
-# Cleanup old versions
-storage.vacuum()
-
-# Shutdown
-storage.close()
+#    user_id  face_embedding_sum
+# 0        2                 1.0
+# 1        3                 1.0
 ```
 
----
-## Summary
 
-**NDim HTAP** applies Zarr's multi-dimensional chunking to tabular data, enabling:
-- Direct coordinate-based file access (O(1) lookup)
-- Hybrid OLTP/OLAP performance
-- Copy-on-Write MVCC for concurrency
-- Embarrassingly parallel I/O
+## Limitations & Known Issues
 
-**Python POC** demonstrates viability with 10-100x speedups on targeted queries.
+As a PoC, the engine has strict boundaries. Many features are architectural skeletons awaiting full implementation.
 
-**Rust port** will unlock true potential with zero-copy operations, SIMD, and async I/O.
+* **Missing Compaction (Vacuum):**
+    The system currently uses a "Merge-on-Read" strategy, creating new file versions (`_v2`, `_v3`) for every update.
+    * *Current Issue:* The `vacuum()` logic to physically merge old files and reclaim space is **not yet implemented**. The storage footprint grows indefinitely with updates.
 
-**Target use cases**: Analytics dashboards, time-series data, event logs, any workload with multi-dimensional access patterns.
+
+* **Incomplete Vector Operations:**
+    While the interface supports SQL:2023 MDA syntax, the backend implementation is limited.
+.
+
+* **Naive Update Mechanism:**
+    Updates follow a "Happy Path". There is no rollback mechanism if a write fails halfway through.
+    * *Concurrency:* While file-locking exists, it is not robust against process crashes (No Write-Ahead Log).
+    * *Error Handling:* Type mismatches or I/O errors may leave the dataset in an inconsistent state.
+
+* **Dependencies:**
+    Heavy reliance on the Python Global Interpreter Lock (GIL) limits true parallelism during query execution.
+
+##  Roadmap: Engineering & Performance
+
+The goal is to evolve from a prototype to a stable, performant engine.
+
+### Phase 1: Code Quality & Stability
+- [ ] **Code Hardening:** Refactor the codebase to handle edge cases, type mismatches, and file corruption gracefully.
+- [ ] **Structured Logging:** Replace `print` debugging with a proper logging rotation system.
+- [ ] **Testing Suite:** Implement a comprehensive Unit and Integration Test suite.
+
+### Phase 2: Core Performance Optimization
+- [ ] **Smart Caching:** Implement a Cache for Chunk Metadata and frequent file handles to reduce filesystem metadata operations (`stat`/`open`).
+- [ ] **I/O Optimization:** 
+- [ ] **Memory Management:** Refactor the pipeline to enforce strictly **Zero-Copy** semantics where possible, passing pointers between PyArrow and NumPy without duplication.
+
+### Phase 3: The Rust Port (Long Term)
+- [ ] **Rewrite Core in Rust:** To solve the GIL and performance issues definitively, the storage engine core (IO, Locking, Coordinates) will be ported to Rust, exposing a high-level Python binding.

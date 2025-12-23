@@ -23,7 +23,7 @@ class FilterEngine:
             return pc.less(column, value)
         if op == "<=":
             return pc.less_equal(column, value)
-        if op == "IN":
+        if op.upper() == "IN":
             return pc.is_in(column, value_set=pa.array(value))
         raise ValueError(f"Unsupported operator: {op}")
 
@@ -36,6 +36,9 @@ class FilterEngine:
         """
         if not expression:
             return pa.array([True] * len(table))
+
+        if len(expression) == 1:
+            expression = expression[0]
 
         if isinstance(expression, tuple):
             col, op, val = expression
