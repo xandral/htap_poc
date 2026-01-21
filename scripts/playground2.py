@@ -343,6 +343,35 @@ def main():
     print(f" Query returned {len(res)} rows")
     print(f" Time: {time.time() - t0:.4f}s")
 
+    # =========================================================
+    # PART 8: DELETE OPERATION TEST
+    # =========================================================
+    print("\n" + "=" * 60)
+    print(" PART 8: DELETE OPERATION")
+    print("=" * 60)
+
+    print("\n--- Testing delete functionality ---")
+    
+    # Count rows before delete
+    initial_count = store2.scan(filters=[("region", "=", 1)], columns=["region"])
+    print(f" Initial rows with region=1: {len(initial_count)}")
+    
+    # Perform delete operation
+    print(" Executing delete where region=1...")
+    t0 = time.time()
+    store2.delete(filters=[("region", "=", 1)])
+    print(f" Delete operation time: {time.time() - t0:.4f}s")
+    
+    # Count rows after delete
+    remaining_count = store2.scan(filters=[("region", "=", 1)], columns=["region"])
+    print(f" Remaining rows with region=1: {len(remaining_count)}")
+    
+    # Verify total count decreased
+    total_remaining = store2.scan(columns=["region"])
+    print(f" Total remaining rows: {len(total_remaining)}")
+    
+    print(f" ✓ Delete operation completed successfully!")
+
     store2.close()
 
 

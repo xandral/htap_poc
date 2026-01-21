@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional, Tuple, Callable
 from dataclasses import dataclass
-
+from src.core.expressions import ColumnRef, ArithmeticExpr
 
 from src.core.storage import NDimStorage
 from src.core.vector_operations import VectorOps
@@ -66,6 +66,39 @@ class Column(Expression):
 
     def __init__(self, name: str):
         self.name = name
+
+        # Operatori aritmetici per update colonnari
+    def __add__(self, other):
+        return ArithmeticExpr(ColumnRef(self.name), "+", self._wrap(other))
+    
+    def __sub__(self, other):
+        return ArithmeticExpr(ColumnRef(self.name), "-", self._wrap(other))
+    
+    def __mul__(self, other):
+        return ArithmeticExpr(ColumnRef(self.name), "*", self._wrap(other))
+    
+    def __truediv__(self, other):
+        return ArithmeticExpr(ColumnRef(self.name), "/", self._wrap(other))
+    
+    def __radd__(self, other):
+        return ArithmeticExpr(self._wrap(other), "+", ColumnRef(self.name))
+    
+    def __rsub__(self, other):
+        return ArithmeticExpr(self._wrap(other), "-", ColumnRef(self.name))
+    
+    def __rmul__(self, other):
+        return ArithmeticExpr(self._wrap(other), "*", ColumnRef(self.name))
+    
+    def __rtruediv__(self, other):
+        return ArithmeticExpr(self._wrap(other), "/", ColumnRef(self.name))
+    
+    def _wrap(self, other):
+        """Converte Column in ColumnRef per serializzazione."""
+        if isinstance(other, Column):
+            return ColumnRef(other.name)
+        elif isinstance(other, ArithmeticExpr):
+            return other
+        return other
 
     def v_slice(self, start: int, stop: int) -> "VectorTransformation":
         """Slices a vector/list column (Lazy)."""
@@ -269,6 +302,23 @@ class DDIMFrame:
         """Public API for writing data."""
         self._storage.write_batch(data)
 
+    def delete(self) -> int:
+        """
+        Delete rows matching the current filters.
+        Returns the number of affected chunks.
+        """
+        # Convert API filters to storage format
+        storage_filters = []
+        for f in self._filters:
+            if isinstance(f, BinaryFilter) and isinstance(f.left, Column):
+                storage_filters.append((f.left.name, f.op, f.right))
+        
+        # Compile vector operations if any
+        vector_ops = self._compile_ops() if self._transformations else None
+        
+        # Execute delete operation
+        self._storage.delete(filters=storage_filters, vector_ops=vector_ops)
+
     def explain(self):
         """Prints the query plan."""
         print(f"=== Plan for '{self._table_name}' ===")
@@ -384,6 +434,42 @@ class DDIMFrame:
 
     def to_pandas(self):
         return self.collect().to_pandas()
+    
+    def update(self, updates: dict) -> "DDIMFrame":
+        """
+        Update rows matching current filters.
+        
+        Args:
+            updates: Dict mapping column names to new values.
+                     Values can be:
+                     - Scalars: {"status": "inactive"}
+                     - Column refs: {"col_a": col("col_b")}
+                     - Expressions: {"col_a": col("col_b") * 2 + 10}
+        
+        Example:
+            df.filter(col("region") == "US").update({
+                "backup_email": col("primary_email"),
+                "score": col("base_score") * 1.5
+            })
+        """
+        # Converti filtri API in formato storage
+        storage_filters = []
+        for f in self._filters:
+            if isinstance(f, BinaryFilter) and isinstance(f.left, Column):
+                storage_filters.append((f.left.name, f.op, f.right))
+        
+        # Compila vector ops se presenti
+        vector_ops = self._compile_ops() if self._transformations else None
+        
+        # Esegui update
+        self._storage.update(
+            filters=storage_filters,
+            updates=updates,
+            vector_ops=vector_ops,
+            operation="update"
+        )
+        
+        return self
 
 
 class DDIMSession:

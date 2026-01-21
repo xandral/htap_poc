@@ -1,0 +1,18 @@
+[package]
+name = "parquet_benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parquet = { version = "53", features = ["arrow"] }
+arrow = { version = "53", features = ["prettyprint"] }
+sha2 = "0.10"
+glob = "0.3"
+duckdb = { version = "1.0", features = ["bundled"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true

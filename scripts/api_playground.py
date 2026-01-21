@@ -29,12 +29,19 @@ def check_result(test_name, computed, expected, tolerance=1e-5):
         if isinstance(computed, (np.ndarray, list)) or isinstance(
             expected, (np.ndarray, list)
         ):
-            np.testing.assert_allclose(computed, expected, rtol=tolerance)
+            # Check if dealing with strings
+            if (isinstance(computed, (list, np.ndarray)) and len(computed) > 0 and 
+                isinstance(computed[0] if isinstance(computed, list) else computed.flat[0], str)):
+                # String comparison
+                assert computed == expected or list(computed) == list(expected)
+            else:
+                # Numeric comparison
+                np.testing.assert_allclose(computed, expected, rtol=tolerance)
         else:
             # Standard scalar comparison
             assert computed == expected
         print(f"  CHECK PASSED: {test_name}")
-    except AssertionError:
+    except (AssertionError, ValueError, TypeError):
         print(f"   CHECK FAILED: {test_name}")
         print(f"      Got: {computed}")
         print(f"      Exp: {expected}")
@@ -204,8 +211,74 @@ def run_test_suite():
 
     check_result("AI Similarity Scores", res_ai["score"].values, scores_manual)
 
+    # =========================================================================
+    # TEST 4: DELETE OPERATION
+    # =========================================================================
     print("\n" + "=" * 60)
-    print(" ALL TESTS PASSED 'GROUND TRUTH' VALIDATION")
+    print("🗑️ TEST 4: DELETE OPERATION")
+    print("=" * 60)
+    
+    # 1. Setup Dataset with more data for delete testing
+    df_delete = session.create_dataset("delete_test", hash_dims={"category": 3})
+    
+    # Generate test data
+    categories = ["A", "B", "C"] * 5
+    values = list(range(15))
+    scores = [float(i * 10) for i in range(15)]
+    
+    data_delete = pa.Table.from_pydict({
+        "category": categories,
+        "value": values,
+        "score": scores
+    })
+    df_delete.write(data_delete)
+    print(f"✓ Ingested 15 rows for delete testing.")
+    
+    # 2. Check initial count
+    initial_result = df_delete.select("category", "value", "score").collect()
+    initial_count = len(initial_result)
+    print(f"Initial row count: {initial_count}")
+    
+    # 3. Delete specific rows (category = "B")
+    print("\n--- Deleting rows where category = 'B' ---")
+    delete_query = df_delete.filter(col("category") == "B")
+    delete_query.delete()
+    
+    # 4. Verify deletion worked
+    remaining_result = df_delete.select("category", "value", "score").collect().to_pandas().sort_values("value")
+    remaining_count = len(remaining_result)
+    
+    print(f"Remaining row count: {remaining_count}")
+    print("\n--- Remaining data (first 10 rows) ---")
+    print(remaining_result.head(10))
+    
+    # 5. Ground truth verification
+    print("\n🔎 Running 'Ground Truth' verification...")
+    expected_remaining = [cat for cat in categories if cat != "B"]
+    expected_count = len(expected_remaining)
+    
+    check_result("Delete Row Count", remaining_count, expected_count)
+    
+    # Verify no "B" categories remain
+    remaining_categories = remaining_result["category"].unique().tolist()
+    expected_categories = ["A", "C"]
+    check_result("Delete Categories Remaining", sorted(remaining_categories), sorted(expected_categories))
+    
+    print("\n--- Testing delete with complex filter ---")
+    # Delete rows where score > 100
+    delete_query2 = df_delete.filter(col("score") > 100)
+    delete_query2.delete()
+    
+    final_result = df_delete.select("category", "value", "score").collect().to_pandas()
+    final_count = len(final_result)
+    print(f"Final row count after second delete: {final_count}")
+    
+    # All scores should be <= 100
+    max_score = final_result["score"].max()
+    check_result("Delete Max Score After Filter", max_score <= 100, True)
+    
+    print("\n" + "=" * 60)
+    print("✅ ALL TESTS PASSED 'GROUND TRUTH' VALIDATION")
     print("=" * 60)
 
 

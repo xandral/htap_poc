@@ -21,6 +21,10 @@ from src.utils.filters import FilterEngine
 from src.utils.schema_manager import SchemaManager
 from src.utils.coordinates import get_hash_bucket
 
+from src.core.expressions import (
+    ColumnRef, ArithmeticExpr, ExpressionEvaluator, serialize_updates
+)
+
 
 
 class NDimStorage:
@@ -53,7 +57,7 @@ class NDimStorage:
         self.catalog = FileCatalog(self.base_path)
         self.sequence = SequenceManager(self.base_path)
         self.schema = SchemaManager(self.base_path)
-        self.io_pool = ThreadPoolExecutor(max_workers=1)
+        self.io_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         self.chunk_metadata = ChunkMetadataManager(self.base_path)
 
         # Cache: {logical_key: {tid: table}}
@@ -303,7 +307,9 @@ class NDimStorage:
             )
 
         global_id = self.schema.column_map["global_id"]
-        needed_columns = self._ensure_global_id(needed_columns, global_id)
+       # needed_columns = self._ensure_global_id(needed_columns, global_id)
+        if global_id not in needed_columns:
+            needed_columns = needed_columns + [global_id]
 
         # 2. Filter phase (if needed)
         valid_ids, ids_by_chunk, cached_chunks, processed_chunks = (
@@ -349,12 +355,7 @@ class NDimStorage:
         return self._return_scan_result(
             full, return_candidates, return_valid_ids, candidates, valid_ids
         )
-
-    def _ensure_global_id(self, needed_columns: List[str], global_id: str) -> List[str]:
-        """Ensure global_id is in needed columns."""
-        if global_id not in needed_columns:
-            return needed_columns + [global_id]
-        return needed_columns
+    
 
     def _execute_filter_phase(
         self, candidates, filters, needed_columns, vector_ops, tid, global_id
@@ -392,7 +393,7 @@ class NDimStorage:
         )
 
         if not filter_results:
-            return None, None, cached_chunks, processed_chunks
+            return np.array([]), {}, cached_chunks, processed_chunks
 
         valid_ids = np.unique(np.concatenate(filter_results))
         ids_by_chunk = self._group_ids_by_chunk(valid_ids)
@@ -445,7 +446,7 @@ class NDimStorage:
                 # Check cache
                 cache_tid = 0
                 if part in self._in_memory_updates:
-                    cache_tid = min(
+                    cache_tid = max(
                         t for t in self._in_memory_updates[part] if t <= tid
                     )
                     t = self._in_memory_updates[part][cache_tid]
@@ -484,7 +485,7 @@ class NDimStorage:
                 for patch_tid, patch_dict in patches:
                     patch = patch_dict.get(part)
                     if patch is not None:
-                        t = self._update(t, patch)
+                        t = self._apply_patch(t, patch)
 
                 # Apply filters
                 mask = FilterEngine.evaluate(t, filters)
@@ -591,6 +592,7 @@ class NDimStorage:
                     except Exception as e:
                         print(f"⚠️ Error in vector ops: {e}")
 
+
                 return (path, table)
 
             except Exception as e:
@@ -628,7 +630,7 @@ class NDimStorage:
                     patch_tid in self.patch_log
                     and logical_key in self.patch_log[patch_tid]
                 ):
-                    cached_table = self._update(
+                    cached_table = self._apply_patch(
                         cached_table, self.patch_log[patch_tid][logical_key]
                     )
 
@@ -660,35 +662,27 @@ class NDimStorage:
         """Load chunk from disk."""
         if path in cached_chunks:
             table = cached_chunks[path]
-        else:
-            schema = pq.read_schema(path)
-
-            if has_pending_patches:
-                # Full read for consistency
-                table = pq.read_table(path)
-            else:
-                # Optimized read
-                avail = [c for c in needed_columns if c in schema.names]
-                if not avail:
-                    return None
-                table = pq.read_table(path, columns=avail)
-
-        # Filter by valid IDs
-        if chunk_valid_ids is not None:
-            table_ids = table[global_id].to_numpy()
-            mask = np.isin(table_ids, chunk_valid_ids)
-            if not mask.any():
+        elif has_pending_patches:
+            # IMPORTANT: With patches, read EVERYTHING for merge-on-read
+            table = pq.read_table(path)
+        elif chunk_valid_ids is not None and len(chunk_valid_ids) > 0:
+            # Row group pruning only when no patches pending
+            table = self._read_with_row_group_pruning(
+                path, chunk_valid_ids, global_id, needed_columns
+            )
+            if table is None:
                 return None
-            table = table.filter(pa.array(mask))
+        else:
+            table = pq.read_table(path)
 
-        # Apply patches
+        # Apply patches first
         if has_pending_patches:
             for patch_tid in sorted(self.patch_log.keys()):
                 if patch_tid > tid:
                     break
 
                 if logical_key in self.patch_log[patch_tid]:
-                    table = self._update(table, self.patch_log[patch_tid][logical_key])
+                    table = self._apply_patch(table, self.patch_log[patch_tid][logical_key])
 
             # Cache complete chunk
             with self._cache_lock:
@@ -696,7 +690,72 @@ class NDimStorage:
                     self._in_memory_updates[logical_key] = {}
                 self._in_memory_updates[logical_key][tid] = table
 
+        # Filter by valid IDs after patches applied
+        if chunk_valid_ids is not None:
+            table_ids = table[global_id].to_numpy()
+            mask = np.isin(table_ids, chunk_valid_ids)
+            if not mask.any():
+                return None
+            table = table.filter(pa.array(mask))
+
         return table
+
+    def _read_with_row_group_pruning(self, path, valid_ids, global_id, columns):
+        """
+        Read only row groups that contain the requested IDs.
+        Uses min/max statistics from parquet metadata to skip row groups outside range.
+
+        Args:
+            path: Path to parquet file
+            valid_ids: numpy array of valid global IDs to read
+            global_id: name of the global ID column
+            columns: list of columns to read (or None for all)
+
+        Returns:
+            PyArrow Table with only relevant row groups, or None if no matches
+        """
+        parquet_file = pq.ParquetFile(path)
+        metadata = parquet_file.metadata
+
+        if metadata.num_row_groups == 0:
+            return None
+
+        min_id = int(valid_ids.min())
+        max_id = int(valid_ids.max())
+
+        valid_row_groups = []
+        for i in range(metadata.num_row_groups):
+            rg = metadata.row_group(i)
+
+            # Find column index for global_id
+            col_idx = None
+            for j in range(rg.num_columns):
+                if parquet_file.schema_arrow.field(j).name == global_id:
+                    col_idx = j
+                    break
+
+            if col_idx is not None:
+                col_meta = rg.column(col_idx)
+                if col_meta.is_stats_set:
+                    stats = col_meta.statistics
+                    rg_min = stats.min
+                    rg_max = stats.max
+                    # Skip if range does not overlap
+                    if rg_max < min_id or rg_min > max_id:
+                        continue
+
+            valid_row_groups.append(i)
+
+        if not valid_row_groups:
+            return None
+
+        # Read only valid row groups
+        tables = []
+        for rg_idx in valid_row_groups:
+            t = parquet_file.read_row_group(rg_idx, columns=columns)
+            tables.append(t)
+
+        return pa.concat_tables(tables) if tables else None
 
     def _apply_final_projection(
         self, table: pa.Table, columns: List[str], global_id: str
@@ -819,6 +878,10 @@ class NDimStorage:
                 if hasattr(op, "columns"):
                     vector_columns.update(op.columns)
 
+        # Handle None columns parameter
+        if columns is None:
+            columns = []
+        
         if filters:
             candidates = self._evaluate_pruning(filters, set(candidates))
             filter_columns = FilterEngine.extract_columns(filters)
@@ -916,10 +979,10 @@ class NDimStorage:
         return filtered
 
     # --- Update Path ---
-
-    def update(self, filters, updates, unsafe=False, vector_ops=None):
+    def update(self, filters, updates, unsafe=False, vector_ops=None, operation="update"):
         """
         Write patch log for merge-on-read updates.
+        Supports scalar values and column expressions.
         """
         tid = self.sequence.allocate_tids()
 
@@ -927,10 +990,14 @@ class NDimStorage:
         final_candidates = self._evaluate_pruning(filters, set(candidates))
 
         if not final_candidates:
-            print(f" Update TID={tid}: No chunks found")
+            print(f" {operation.capitalize()} TID={tid}: No chunks found")
             return
 
+        # Serialize vector ops
         serialized_vector_ops = VectorOpSerializer.serialize_ops(vector_ops)
+        
+        # Serialize updates (handles Column, ArithmeticExpr, scalars)
+        serialized_updates = serialize_updates(updates)
 
         if tid not in self.patch_log:
             self.patch_log[tid] = {}
@@ -950,9 +1017,10 @@ class NDimStorage:
                 "thread_id": thread_id,
                 "process_id": process_id,
                 "filters": filters,
-                "updates": updates,
+                "updates": serialized_updates, 
                 "unsafe": unsafe,
                 "vector_ops": serialized_vector_ops,
+                "operation": operation,
             }
 
             self.patch_log[tid][logical_key] = patch_data
@@ -961,92 +1029,187 @@ class NDimStorage:
                 json.dump(patch_data, f, indent=2, cls=NumpyEncoder)
 
         print(
-            f"✅ Update TID={tid}: Patch log saved for {len(final_candidates)} chunk(s)"
+            f"✅ {operation.capitalize()} TID={tid}: Patch log saved for {len(final_candidates)} chunk(s)"
         )
+    
+    def delete(self, filters, vector_ops=None):
+        """
+        Delete rows by adding delete operation to patch log.
+        """
+        return self.update(filters=filters, updates={}, vector_ops=vector_ops, operation="delete")
 
-    def _update(
-        self,
-        table: pa.Table,
-        patch_metadata: Dict,
-        logical_key: str = None,
-        candidate_path: Path = None,
-    ) -> pa.Table:
+    # =========================================================================
+    # REFACTORED: _apply_patch (formerly _update)
+    # =========================================================================
+    
+    def _apply_patch(self, table: pa.Table, patch_metadata: Dict) -> pa.Table:
         """
         Apply a single patch to an in-memory table.
+        
+        This method is called during scan when a chunk has pending patches.
+        The table should already have all required columns loaded (handled
+        by the scan path which loads the full chunk when patches exist).
+        
+        Supports:
+        - DELETE: removes rows matching filters
+        - UPDATE: modifies column values for rows matching filters
+          - Scalar values
+          - Column references (copy from another column)
+          - Arithmetic expressions (col("a") * 2 + col("b"))
+        
+        Args:
+            table: PyArrow Table to patch
+            patch_metadata: Dict containing filters, updates, operation, etc.
+            
+        Returns:
+            Patched PyArrow Table
         """
-        filters = patch_metadata["filters"]
-        updates = patch_metadata["updates"]
-
-        # Deserialize vector ops
+        filters = patch_metadata.get("filters", [])
+        updates = patch_metadata.get("updates", {})
+        operation = patch_metadata.get("operation", "update")
+        
+        # Deserialize vector ops if present
         serialized_vector_ops = patch_metadata.get("vector_ops")
         vector_ops = VectorOpSerializer.deserialize_ops(serialized_vector_ops)
-
-        # Check for missing columns
-        missing_update_cols = set(updates.keys()) - set(table.column_names)
-        missing_vector_cols = set()
-
+        
+        # Apply vector ops first (they may add columns needed for filtering)
         if vector_ops:
-            for op in vector_ops:
-                if hasattr(op, "columns"):
-                    missing_vector_cols.update(
-                        set(op.columns) - set(table.column_names)
-                    )
-
-        missing_cols = missing_update_cols | missing_vector_cols
-
-        # Reload if missing critical columns
-        if missing_cols and candidate_path and candidate_path.exists():
-            try:
-                full_table = pq.read_table(candidate_path)
-
-                # Apply previous patches
-                tid = patch_metadata.get("tid", 0)
-                for patch_tid in sorted(self.patch_log.keys()):
-                    if patch_tid >= tid:
-                        break
-                    if logical_key in self.patch_log[patch_tid]:
-                        full_table = self._update(
-                            full_table,
-                            self.patch_log[patch_tid][logical_key],
-                            logical_key=logical_key,
-                            candidate_path=candidate_path,
-                        )
-
-                table = full_table
-            except Exception as e:
-                print(f" Error reloading chunk: {e}")
-
-        # Apply vector ops
-        if vector_ops:
-            try:
-                for op_func in vector_ops:
+            for op_func in vector_ops:
+                try:
                     table = op_func(table)
-            except Exception as e:
-                print(f" Error in vector ops: {e}")
-
-        # Calculate mask
-        mask = FilterEngine.evaluate(table, filters)
-        if mask is None or pc.sum(mask.cast("int8")).as_py() == 0:
-            return table
-
-        # Apply updates
-        new_cols = []
-        for col in table.column_names:
-            if col in updates:
-                update_val = updates[col]
-
-                if callable(update_val):
-                    new_val = update_val(table)
-                else:
-                    new_val = pa.scalar(update_val, type=table[col].type)
-
-                new_cols.append(pc.if_else(mask, new_val, table[col]))
-            else:
-                new_cols.append(table[col])
-
-        return pa.Table.from_arrays(new_cols, names=table.column_names)
-
+                except Exception as e:
+                    print(f"⚠️ Error in vector op during patch: {e}")
+        
+        # Check if table has all columns needed for filtering
+        if filters:
+            required_filter_cols = FilterEngine.extract_columns(filters)
+            available_cols = set(table.column_names)
+            missing_filter_cols = required_filter_cols - available_cols
+            
+            if missing_filter_cols:
+                # This chunk doesn't have the filter columns - patch doesn't apply
+                return table
+        
+        # Evaluate filter mask
+        mask = FilterEngine.evaluate(table, filters) if filters else None
+        
+        # If no rows match, return unchanged
+        if mask is not None:
+            match_count = pc.sum(mask.cast("int8")).as_py()
+            if match_count == 0:
+                return table
+        
+        # Handle DELETE operation
+        if operation == "delete":
+            if mask is None:
+                # No filters = delete all (dangerous, but allowed with unsafe flag)
+                return pa.Table.from_pylist([])
+            return table.filter(pc.invert(mask))
+        
+        # Handle UPDATE operation
+        return self._apply_update_values(table, updates, mask)
     
+    def _apply_update_values(
+        self, 
+        table: pa.Table, 
+        updates: Dict, 
+        mask: Optional[pa.Array]
+    ) -> pa.Table:
+        """
+        Apply update values to table columns where mask is True.
+        
+        Args:
+            table: Source table
+            updates: Dict of {column_name: new_value}
+                     Values can be scalars, column_ref dicts, or arithmetic_expr dicts
+            mask: Boolean array indicating rows to update (None = all rows)
+            
+        Returns:
+            Updated table
+        """
+        if not updates:
+            return table
+        
+        # Check which update columns are in this table
+        available_cols = set(table.column_names)
+        applicable_updates = {k: v for k, v in updates.items() if k in available_cols}
+        
+        if not applicable_updates:
+            # None of the update columns are in this chunk
+            return table
+        
+        # Check if we have all columns required for expressions
+        required_expr_cols = set()
+        for col_name, value in applicable_updates.items():
+            required_expr_cols.update(
+                ExpressionEvaluator.get_required_columns(value)
+            )
+        
+        missing_expr_cols = required_expr_cols - available_cols
+        if missing_expr_cols:
+            # This chunk doesn't have columns needed for expression evaluation
+            # This can happen with vertical chunking - update doesn't apply here
+            return table
+        
+        # Build new columns
+        new_columns = []
+        for col_name in table.column_names:
+            if col_name in applicable_updates:
+                new_col = self._compute_updated_column(
+                    table, col_name, applicable_updates[col_name], mask
+                )
+                new_columns.append(new_col)
+            else:
+                new_columns.append(table[col_name])
+        
+        return pa.Table.from_arrays(new_columns, names=table.column_names)
+    
+    def _compute_updated_column(
+        self,
+        table: pa.Table,
+        col_name: str,
+        update_value,
+        mask: Optional[pa.Array]
+    ) -> pa.Array:
+        """
+        Compute the new value for a single column.
+        
+        Args:
+            table: Source table
+            col_name: Name of column being updated
+            update_value: New value (scalar, column_ref, or arithmetic_expr)
+            mask: Boolean array (rows where True get updated)
+            
+        Returns:
+            PyArrow Array with updated values
+        """
+        original_col = table[col_name]
+        original_type = original_col.type
+        
+        try:
+            # Evaluate the update expression
+            new_value = ExpressionEvaluator.evaluate(update_value, table)
+            
+            # If scalar, broadcast to array length
+            if not isinstance(new_value, (pa.Array, pa.ChunkedArray)):
+                new_value = pa.scalar(new_value, type=original_type)
+            
+            # Apply conditionally if mask exists
+            if mask is not None:
+                return pc.if_else(mask, new_value, original_col)
+            else:
+                # No mask = update all rows
+                if isinstance(new_value, pa.Scalar):
+                    return pa.array([new_value.as_py()] * len(table), type=original_type)
+                return new_value
+                
+        except Exception as e:
+            print(f"⚠️ Error computing update for '{col_name}': {e}")
+            return original_col
+
+    # Alias for backward compatibility
+    _update = _apply_patch
+
     # DEPRECATED TODO IMPLEMENT NEW COMPACTION
     def vacuum(self):
         """Clean up old versions (deprecated)."""
