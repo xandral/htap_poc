@@ -66,7 +66,7 @@ class NDimStorage:
 
         # Patch log: {tid: {logical_key: patch_metadata}}
         self.patch_log: Dict[int, Dict[str, Dict]] = {}
-        self.active_tids = {}  # tid: timestamp
+        self.active_tids = {}  # tid: timestamp ## TODO: BETTER LOCKED?
 
         # Load existing configuration
         self._load_dim_configs()
@@ -147,6 +147,7 @@ class NDimStorage:
         hash_cols = []
         for k in self.hash_keys:
             if k not in table.column_names:
+                print(f" Warning: Hash key '{k}' not in table columns.")
                 continue
             data = table[k].to_numpy()
             if np.issubdtype(data.dtype, np.integer):
@@ -163,6 +164,7 @@ class NDimStorage:
         range_cols = []
         for k in self.range_keys:
             if k not in table.column_names:
+                print(f" Warning: Range key '{k}' not in table columns.")
                 continue
             range_cols.append(table[k].to_numpy() // self.range_dims[k])
         
@@ -373,8 +375,12 @@ class NDimStorage:
         common_cols = set(needed_columns) & set(filter_columns)
         can_cache = len(common_cols) > 0
 
-        target_filter_chunks = self._get_filter_chunk_indices(filter_columns)
-        has_data_filter = len(target_filter_chunks) > 0
+        target_filter_chunks = set()
+        for col in filter_columns:
+            c_idx = self.schema.get_chunk_index(col, self.chunk_cols)
+            if c_idx is not None:
+                target_filter_chunks.add(c_idx)
+        
 
         filter_results = self._process_filter_chunks(
             candidates,
@@ -382,7 +388,6 @@ class NDimStorage:
             filter_columns,
             needed_columns,
             target_filter_chunks,
-            has_data_filter,
             can_cache,
             common_cols,
             cached_chunks,
@@ -396,21 +401,6 @@ class NDimStorage:
             return np.array([]), {}, cached_chunks, processed_chunks
 
         valid_ids = np.unique(np.concatenate(filter_results))
-        ids_by_chunk = self._group_ids_by_chunk(valid_ids)
-
-        return valid_ids, ids_by_chunk, cached_chunks, processed_chunks
-
-    def _get_filter_chunk_indices(self, filter_columns: Set[str]) -> Set[int]:
-        """Get chunk indices for filter columns."""
-        target_chunks = set()
-        for col in filter_columns:
-            c_idx = self.schema.get_chunk_index(col, self.chunk_cols)
-            if c_idx is not None:
-                target_chunks.add(c_idx)
-        return target_chunks
-
-    def _group_ids_by_chunk(self, valid_ids: np.ndarray) -> Dict[int, np.ndarray]:
-        """Group valid IDs by row chunk."""
         ids_by_chunk = {}
         chunk_indices = valid_ids // self.chunk_rows
         unique_chunks = np.unique(chunk_indices)
@@ -418,7 +408,8 @@ class NDimStorage:
         for chk_idx in unique_chunks:
             ids_by_chunk[chk_idx] = valid_ids[chunk_indices == chk_idx]
 
-        return ids_by_chunk
+        return valid_ids, ids_by_chunk, cached_chunks, processed_chunks
+
 
     def _process_filter_chunks(
         self,
@@ -427,7 +418,6 @@ class NDimStorage:
         filter_columns,
         needed_columns,
         target_filter_chunks,
-        has_data_filter,
         can_cache,
         common_cols,
         cached_chunks,
@@ -442,7 +432,15 @@ class NDimStorage:
         def process_filter(path):
             try:
                 part = path.name.split("_v")[0]
+                parts = path.name.split("_")
+                chunk_c_idx = int(parts[2][1:])
 
+                if target_filter_chunks and chunk_c_idx not in target_filter_chunks:
+                    return None
+
+                if not target_filter_chunks and chunk_c_idx != 0:
+                    return None
+            
                 # Check cache
                 cache_tid = 0
                 if part in self._in_memory_updates:
@@ -451,15 +449,6 @@ class NDimStorage:
                     )
                     t = self._in_memory_updates[part][cache_tid]
                 else:
-                    # Read from disk
-                    parts = path.name.split("_")
-                    chunk_c_idx = int(parts[2][1:])
-
-                    if has_data_filter and chunk_c_idx not in target_filter_chunks:
-                        return None
-
-                    if not has_data_filter and chunk_c_idx != 0:
-                        return None
 
                     schema = pq.read_schema(path)
                     filter_cols_needed = list(filter_columns) + [global_id]
@@ -624,15 +613,13 @@ class NDimStorage:
             cached_tid = max(available_tids)
             cached_table = self._in_memory_updates[logical_key][cached_tid]
 
+            relevant_tids = sorted([t for t in self.patch_log.keys() if cached_tid < t <= tid])
+
             # Apply subsequent patches
-            for patch_tid in range(cached_tid + 1, tid + 1):
-                if (
-                    patch_tid in self.patch_log
-                    and logical_key in self.patch_log[patch_tid]
-                ):
-                    cached_table = self._apply_patch(
-                        cached_table, self.patch_log[patch_tid][logical_key]
-                    )
+            for patch_tid in relevant_tids:
+                cached_table = self._apply_patch(
+                    cached_table, self.patch_log[patch_tid][logical_key]
+                )
 
             # Filter by valid IDs
             if chunk_valid_ids is not None:
